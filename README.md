@@ -6,7 +6,7 @@ An AI/LLM research lab: ingest PDF documents (mainly Vietnamese) into a local [Q
 
 - **PDF ingestion**: extracts text, repairs legacy Vietnamese font encodings, re-joins split syllables (`c ủa` → `của`), and chunks by token count at paragraph/sentence/clause/word boundaries.
 - **Embeddings**: `BAAI/bge-m3` (1024 dimensions, cosine). Runs on GPU in fp16 when CUDA is available, otherwise on CPU.
-- **HTTP upload**: `POST /upload` accepts a PDF and ingests it in the background with a single worker; jobs are tracked in SQLite.
+- **HTTP bulk upload**: `POST /upload` accepts several PDFs per request and ingests them in the background with a single worker; jobs are tracked in SQLite and grouped into batches.
 - **RAG chatbot**: retrieves relevant chunks from Qdrant and passes them to a local LLM (Gemma 2B via llama.cpp's `llama-server`, GPU-accelerated). Answers stream back with sources (file, page, chunk, score).
 - If no chunk is relevant enough, the bot replies that it has no answer without calling the LLM.
 
@@ -56,18 +56,19 @@ uvicorn app:app --port 8000
 
 - `http://localhost:8000/` upload test page
 - `http://localhost:8000/chat` chat page
-- `POST /upload` (form fields `folder`, `file`) returns 202 with a `job_id`; check progress at `GET /jobs/{id}`
+- `POST /upload` (form fields `folder`, repeated `files`; the old single `file` field still works) returns 202 with `{batch_id, jobs, rejected}`. Invalid files (not a PDF, empty, over the size limit, duplicate name in the batch) go to `rejected` while the valid ones are still queued; the request fails with 400 only if no file is valid, and with 413 if it exceeds the file-count or total-size limit.
+- `GET /batches/{id}` returns the status of a whole batch (per-job state and progress, plus `counts`); `GET /jobs/{id}` returns a single job
 - `POST /chat` (JSON `question`, `top_k`, `folder`, `conversation_id`) returns an NDJSON stream
 
 ### Main environment variables
 
-`QDRANT_URL`, `QDRANT_COLLECTION`, `EMBED_MODEL`, `EMBED_DEVICE` (`cpu`|`cuda`), `MAX_UPLOAD_MB`, `CHAT_MODEL`, `LLM_CTX`, `LLM_GPU_LAYERS`, `LLM_PORT`, `LLAMA_SERVER_BIN`.
+`QDRANT_URL`, `QDRANT_COLLECTION`, `EMBED_MODEL`, `EMBED_DEVICE` (`cpu`|`cuda`), `MAX_UPLOAD_MB` (per file, 50), `MAX_FILES_PER_UPLOAD` (20), `MAX_BATCH_MB` (500), `CHAT_MODEL`, `LLM_CTX`, `LLM_GPU_LAYERS`, `LLM_PORT`, `LLAMA_SERVER_BIN`.
 
 ## Limitations
 
 - No OCR: scanned image-only PDFs produce 0 chunks.
 - Gemma 2B does not reliably emit `[n]` citations; displayed sources come from chunk metadata.
-- No automated tests yet.
+- Tests cover only the upload API (`pip install -r requirements-dev.txt`, then `pytest test_upload.py`); ingestion and RAG are untested.
 
 ## Notes
 

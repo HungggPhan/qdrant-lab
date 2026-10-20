@@ -3,9 +3,10 @@
 Chạy (đúng 1 process để model chỉ nạp một lần):
     uvicorn app:app --host 0.0.0.0 --port 8000
 
-POST /upload  (form: folder, file)  -> 202, status "processing"
+POST /upload  (form: folder, files...) -> 202, {batch_id, jobs, rejected}  (field cũ `file` vẫn nhận)
+GET  /batches/{id}                  -> trạng thái cả lô: counts + từng job
 GET  /jobs/{id}                     -> processing | done | failed
-GET  /                              -> form upload thử
+GET  /                              -> trang upload thử (nhiều file, kéo thả)
 GET  /chat                          -> giao diện chat
 POST /chat  (json: question, top_k) -> NDJSON stream: sources -> token... -> done
 """
@@ -30,7 +31,9 @@ from rag import DEFAULT_MIN_SCORE, MODELS_DIR, NO_ANSWER, Answerer, LlamaServer,
 
 log = logging.getLogger("uvicorn.error")
 
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "50")) * 1024 * 1024  # mỗi file
+MAX_FILES_PER_UPLOAD = int(os.getenv("MAX_FILES_PER_UPLOAD", "20"))  # mỗi request
+MAX_BATCH_BYTES = int(os.getenv("MAX_BATCH_MB", "500")) * 1024 * 1024  # tổng mỗi request
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION = os.getenv("QDRANT_COLLECTION", DEFAULT_COLLECTION)
 EMBED_MODEL = os.getenv("EMBED_MODEL", MODEL_NAME)
@@ -82,18 +85,18 @@ def init_db():
         )
         # cột tiến độ (thêm sau nên migrate cho jobs.db cũ)
         have = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
-        for col, typ in (("stage", "TEXT"), ("progress_done", "INTEGER"), ("progress_total", "INTEGER")):
+        for col, typ in (("stage", "TEXT"), ("progress_done", "INTEGER"), ("progress_total", "INTEGER"), ("batch_id", "TEXT")):
             if col not in have:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
 
 
-def create_job(folder: str, filename: str) -> str:
+def create_job(folder: str, filename: str, batch_id: str | None = None) -> str:
     job_id = uuid.uuid4().hex
     now = time.time()
     with db() as conn, conn:
         conn.execute(
-            "INSERT INTO jobs (id, folder, filename, status, created_at, updated_at) VALUES (?, ?, ?, 'processing', ?, ?)",
-            (job_id, folder, filename, now, now),
+            "INSERT INTO jobs (id, folder, filename, status, created_at, updated_at, batch_id) VALUES (?, ?, ?, 'processing', ?, ?, ?)",
+            (job_id, folder, filename, now, now, batch_id),
         )
     return job_id
 
@@ -213,24 +216,16 @@ def safe_filename(name: str | None) -> str:
     return name
 
 
-@app.post("/upload", status_code=202)
-async def upload(folder: str = Form(...), file: UploadFile = File(...)):
-    folder = folder.strip()
-    if not FOLDER_RE.fullmatch(folder):
-        raise HTTPException(400, "Tên folder chỉ gồm chữ, số, gạch ngang và gạch dưới (tối đa 100 ký tự)")
-    filename = safe_filename(file.filename)
-
-    target_dir = DOCUMENTS_DIR / folder
-    target_dir.mkdir(parents=True, exist_ok=True)
+async def save_upload(file: UploadFile, target_dir: Path, filename: str) -> int:
+    """Ghi một file upload vào target_dir qua file `.part` rồi đổi tên, trả về số byte. Ném HTTPException nếu file không nhận được."""
     target = target_dir / filename
     tmp = target_dir / f".{uuid.uuid4().hex}.part"
-
     size = 0
     try:
         with open(tmp, "wb") as out:
             while chunk := await file.read(1024 * 1024):
-                # if size == 0 and not chunk.startswith(b"%PDF-"):
-                #     raise HTTPException(400, "File không phải PDF hợp lệ")
+                if size == 0 and not chunk.startswith(b"%PDF-"):
+                    raise HTTPException(400, "File không phải PDF hợp lệ")
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
                     raise HTTPException(413, f"File vượt quá {MAX_UPLOAD_BYTES // 1024 // 1024} MB")
@@ -243,17 +238,57 @@ async def upload(folder: str = Form(...), file: UploadFile = File(...)):
             raise HTTPException(409, "File cùng tên đang được xử lý, thử lại sau")
     finally:
         tmp.unlink(missing_ok=True)
-
-    job_id = create_job(folder, filename)
-    jobs_queue.put(job_id)
-    return {"job_id": job_id, "folder": folder, "filename": filename, "status": "processing"}
+    return size
 
 
-@app.get("/jobs/{job_id}")
-def job_status(job_id: str):
-    job = get_job(job_id)
-    if job is None:
-        raise HTTPException(404, "Không tìm thấy job")
+@app.post("/upload", status_code=202)
+async def upload(
+    folder: str = Form(...),
+    files: list[UploadFile] = File(default=[]),
+    file: UploadFile | None = File(default=None),  # tên field cũ (một file), vẫn nhận để không phá client cũ
+):
+    folder = folder.strip()
+    if not FOLDER_RE.fullmatch(folder):
+        raise HTTPException(400, "Tên folder chỉ gồm chữ, số, gạch ngang và gạch dưới (tối đa 100 ký tự)")
+    uploads = ([file] if file is not None else []) + files
+    if len(uploads) > MAX_FILES_PER_UPLOAD:
+        raise HTTPException(413, f"Tối đa {MAX_FILES_PER_UPLOAD} file mỗi lần upload")
+
+    target_dir = DOCUMENTS_DIR / folder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    batch_id = uuid.uuid4().hex
+    accepted, rejected, total = [], [], 0
+    try:
+        for up in uploads:
+            try:
+                filename = safe_filename(up.filename)
+                if filename in accepted:
+                    raise HTTPException(400, "File trùng tên với file trước đó trong lô")
+                total += await save_upload(up, target_dir, filename)
+            except HTTPException as e:  # lỗi của một file không làm hỏng cả lô
+                rejected.append({"filename": up.filename, "reason": e.detail})
+                continue
+            accepted.append(filename)
+            if total > MAX_BATCH_BYTES:
+                raise HTTPException(413, f"Tổng dung lượng vượt quá {MAX_BATCH_BYTES // 1024 // 1024} MB")
+    except HTTPException:
+        for name in accepted:  # từ chối cả request: không để lại file nào của lô này
+            (target_dir / name).unlink(missing_ok=True)
+        raise
+    if not accepted:
+        raise HTTPException(400, {"message": "Không có file nào hợp lệ", "rejected": rejected})
+
+    jobs = []
+    for filename in accepted:
+        job_id = create_job(folder, filename, batch_id)
+        jobs_queue.put(job_id)
+        jobs.append({"job_id": job_id, "filename": filename, "status": "processing"})
+    return {"batch_id": batch_id, "folder": folder, "jobs": jobs, "rejected": rejected}
+
+
+def public_job(job: dict) -> dict:
+    """Dạng job trả cho client: gộp ba cột tiến độ thành `progress`."""
+    job = dict(job)
     stage, done, total = job.pop("stage"), job.pop("progress_done"), job.pop("progress_total")
     job["progress"] = None if stage is None else {
         "stage": stage,  # reading | chunking | embedding | saving
@@ -262,6 +297,26 @@ def job_status(job_id: str):
         "percent": round(100 * done / total) if total else 0,
     }
     return job
+
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Không tìm thấy job")
+    return public_job(job)
+
+
+@app.get("/batches/{batch_id}")
+def batch_status(batch_id: str):
+    with db() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM jobs WHERE batch_id=? ORDER BY rowid", (batch_id,)).fetchall()
+    if not rows:
+        raise HTTPException(404, "Không tìm thấy lô upload")
+    jobs = [public_job(dict(r)) for r in rows]
+    counts = {s: sum(j["status"] == s for j in jobs) for s in ("processing", "done", "failed")}
+    return {"batch_id": batch_id, "folder": jobs[0]["folder"], "counts": counts, "jobs": jobs}
 
 
 # ---------------------------------------------------------------------------
@@ -388,32 +443,79 @@ def chat_page():
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """<!doctype html><meta charset="utf-8"><title>Upload PDF</title>
-<style>body{font:16px system-ui;max-width:520px;margin:2rem auto;padding:0 1rem}
-input,button{display:block;margin:.5rem 0;font:inherit}#out{white-space:pre-wrap;color:#333}</style>
+<style>body{font:16px system-ui;max-width:640px;margin:2rem auto;padding:0 1rem}
+input,button{font:inherit}#drop{display:block;margin:.5rem 0;padding:1.2rem;border:2px dashed #999;border-radius:8px;text-align:center;cursor:pointer}
+#drop.over{background:#eef6ff;border-color:#06c}#files{display:none}
+ul{list-style:none;padding:0}li{padding:.3rem 0;border-bottom:1px solid #eee;display:flex;gap:.6rem;justify-content:space-between}
+.done{color:#080}.failed{color:#b00}#sum{font-weight:600;margin:.5rem 0}</style>
 <h1>Upload PDF</h1>
 <form id="f"><input name="folder" placeholder="Tên folder" required>
-<input name="file" type="file" accept="application/pdf" required><button>Upload</button></form>
-<div id="out"></div>
+<label id="drop" for="files">Kéo thả PDF vào đây hoặc bấm để chọn (nhiều file)<br><small id="picked"></small></label>
+<input id="files" type="file" accept="application/pdf" multiple>
+<button>Upload</button></form>
+<div id="sum"></div><ul id="list"></ul>
 <script>
-const out = document.getElementById('out');
-document.getElementById('f').onsubmit = async e => {
+const $ = id => document.getElementById(id);
+const STAGES = {reading: 'Đọc PDF', chunking: 'Chia chunk', embedding: 'Tạo embedding', saving: 'Ghi vào Qdrant'};
+const KEY = 'lastBatch';
+let timer = null;
+
+function esc(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+function describe(j) {
+  if (j.status === 'done') return ['done', 'Xong: ' + j.chunks + ' chunk'];
+  if (j.status === 'failed') return ['failed', 'Thất bại: ' + j.error];
+  const p = j.progress;
+  return ['', p ? STAGES[p.stage] + ' ' + p.done + '/' + p.total + ' (' + p.percent + '%)' : 'Đang chờ tới lượt xử lý...'];
+}
+function render(jobs, rejected, counts) {
+  $('list').innerHTML = jobs.map(j => { const [c, t] = describe(j);
+    return '<li><span>' + esc(j.filename) + '</span><span class="' + c + '">' + esc(t) + '</span></li>'; }).join('')
+    + rejected.map(x => '<li><span>' + esc(x.filename || '?') + '</span><span class="failed">Bị loại: ' + esc(x.reason) + '</span></li>').join('');
+  if (counts) $('sum').textContent = counts.done + '/' + jobs.length + ' xong, ' + counts.failed + ' lỗi, ' + counts.processing + ' đang xử lý'
+    + (rejected.length ? ', ' + rejected.length + ' bị loại' : '');
+}
+function watch(batchId, rejected) {
+  clearInterval(timer);
+  const tick = async () => {
+    const r = await fetch('/batches/' + batchId);
+    if (!r.ok) { clearInterval(timer); try { localStorage.removeItem(KEY); } catch (e) {} return; }
+    const b = await r.json();
+    render(b.jobs, rejected, b.counts);
+    if (b.counts.processing === 0) { clearInterval(timer); try { localStorage.removeItem(KEY); } catch (e) {} }
+  };
+  tick(); timer = setInterval(tick, 1000);
+}
+function setFiles(list) {
+  const dt = new DataTransfer();
+  for (const f of list) if (f.name.toLowerCase().endsWith('.pdf')) dt.items.add(f);
+  $('files').files = dt.files;
+  $('picked').textContent = dt.files.length ? 'Đã chọn ' + dt.files.length + ' file' : '';
+}
+$('files').onchange = e => setFiles(e.target.files);
+const drop = $('drop');
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); setFiles(e.dataTransfer.files); };
+
+$('f').onsubmit = async e => {
   e.preventDefault();
-  out.textContent = 'Đang upload...';
-  const r = await fetch('/upload', {method: 'POST', body: new FormData(e.target)});
+  const files = $('files').files;
+  if (!files.length) { $('sum').textContent = 'Chưa chọn file PDF nào'; return; }
+  const fd = new FormData();
+  fd.append('folder', e.target.folder.value);
+  for (const f of files) fd.append('files', f);
+  $('sum').textContent = 'Đang upload ' + files.length + ' file...'; $('list').innerHTML = '';
+  const r = await fetch('/upload', {method: 'POST', body: fd});
   const j = await r.json();
-  if (!r.ok) { out.textContent = 'Lỗi: ' + (j.detail || r.status); return; }
-  const head = 'Upload thành công (' + j.filename + '): processing';
-  out.textContent = head + '\\nĐang chờ tới lượt xử lý...';
-  const STAGES = {reading: 'Đọc PDF, trang', chunking: 'Chia chunk, trang', embedding: 'Tạo embedding, chunk', saving: 'Ghi vào Qdrant, chunk'};
-  const t = setInterval(async () => {
-    const s = await (await fetch('/jobs/' + j.job_id)).json();
-    if (s.status === 'processing') {
-      const p = s.progress;
-      if (p) out.textContent = head + '\\n' + STAGES[p.stage] + ' ' + p.done + '/' + p.total + ' (' + p.percent + '%)';
-      return;
-    }
-    clearInterval(t);
-    out.textContent = s.status === 'done' ? 'Xong: ' + s.chunks + ' chunk đã vào Qdrant' : 'Thất bại: ' + s.error;
-  }, 1000);
+  if (!r.ok) {
+    const d = j.detail;
+    $('sum').textContent = 'Lỗi: ' + (typeof d === 'string' ? d : (d && d.message) || r.status);
+    if (d && d.rejected) render([], d.rejected, null);
+    return;
+  }
+  try { localStorage.setItem(KEY, JSON.stringify({id: j.batch_id, rejected: j.rejected})); } catch (e) {}
+  watch(j.batch_id, j.rejected);
 };
+
+try { const last = JSON.parse(localStorage.getItem(KEY)); if (last) watch(last.id, last.rejected || []); } catch (e) {}
 </script>"""
