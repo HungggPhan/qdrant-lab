@@ -128,3 +128,57 @@ def test_batch_status_reports_each_job_and_totals(client, monkeypatch):
 
 def test_unknown_batch_returns_404(client):
     assert client.get("/batches/nope").status_code == 404
+
+
+def test_rejected_batch_leaves_existing_files_untouched(client, monkeypatch):
+    folder = app_module.DOCUMENTS_DIR / "demo"
+    folder.mkdir(parents=True)
+    old = PDF + b"old version"
+    (folder / "report.pdf").write_bytes(old)
+    monkeypatch.setattr(app_module, "MAX_BATCH_BYTES", len(PDF) * 2)
+
+    files = [("files", ("report.pdf", PDF + b"new", "application/pdf"))] + pdfs("b.pdf", "c.pdf")
+    r = client.post("/upload", data={"folder": "demo"}, files=files)
+
+    assert r.status_code == 413
+    assert sorted(p.name for p in folder.iterdir()) == ["report.pdf"]
+    assert (folder / "report.pdf").read_bytes() == old
+    assert app_module.jobs_queue.empty()
+
+
+def test_disk_error_on_one_file_rejects_it_and_keeps_the_rest_consistent(client, monkeypatch):
+    real_replace = app_module.os.replace
+
+    def flaky_replace(src, dst):
+        if str(dst).endswith("b.pdf"):
+            raise OSError("No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(app_module.os, "replace", flaky_replace)
+    r = client.post("/upload", data={"folder": "demo"}, files=pdfs("a.pdf", "b.pdf", "c.pdf"))
+
+    assert r.status_code == 202
+    body = r.json()
+    assert [j["filename"] for j in body["jobs"]] == ["a.pdf", "c.pdf"]
+    assert [x["filename"] for x in body["rejected"]] == ["b.pdf"]
+    folder = app_module.DOCUMENTS_DIR / "demo"
+    assert sorted(p.name for p in folder.iterdir()) == ["a.pdf", "c.pdf"]  # không còn .part, không còn b.pdf
+
+
+def test_duplicate_name_check_ignores_case(client):
+    files = [("files", ("Report.pdf", PDF, "application/pdf")), ("files", ("report.pdf", PDF, "application/pdf"))]
+    body = client.post("/upload", data={"folder": "demo"}, files=files).json()
+
+    assert [j["filename"] for j in body["jobs"]] == ["Report.pdf"]
+    assert [x["filename"] for x in body["rejected"]] == ["report.pdf"]
+
+
+def test_pdf_header_check_boundaries(client):
+    files = [
+        ("files", ("header_only.pdf", b"%PDF-", "application/pdf")),
+        ("files", ("truncated.pdf", b"%PDF", "application/pdf")),
+    ]
+    body = client.post("/upload", data={"folder": "demo"}, files=files).json()
+
+    assert [j["filename"] for j in body["jobs"]] == ["header_only.pdf"]
+    assert [x["filename"] for x in body["rejected"]] == ["truncated.pdf"]

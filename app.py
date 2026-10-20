@@ -216,29 +216,37 @@ def safe_filename(name: str | None) -> str:
     return name
 
 
-async def save_upload(file: UploadFile, target_dir: Path, filename: str) -> int:
-    """Ghi một file upload vào target_dir qua file `.part` rồi đổi tên, trả về số byte. Ném HTTPException nếu file không nhận được."""
-    target = target_dir / filename
+async def stage_upload(file: UploadFile, target_dir: Path) -> tuple[Path, int]:
+    """Ghi một file upload vào file `.part` trong target_dir, trả về (đường dẫn .part, số byte).
+
+    Chưa đụng tới file thật: việc đổi tên làm sau khi cả lô đã qua kiểm tra. Ném HTTPException nếu file
+    không nhận được; mọi lỗi đều xoá file `.part` đang ghi dở.
+    """
     tmp = target_dir / f".{uuid.uuid4().hex}.part"
     size = 0
     try:
+        head = b""
+        while len(head) < len(b"%PDF-"):  # đọc đủ phần đầu rồi mới kiểm tra, không phụ thuộc kích thước lần đọc
+            part = await file.read(len(b"%PDF-") - len(head))
+            if not part:
+                break
+            head += part
+        if not head:
+            raise HTTPException(400, "File rỗng")
+        if not head.startswith(b"%PDF-"):
+            raise HTTPException(400, "File không phải PDF hợp lệ")
         with open(tmp, "wb") as out:
-            while chunk := await file.read(1024 * 1024):
-                if size == 0 and not chunk.startswith(b"%PDF-"):
-                    raise HTTPException(400, "File không phải PDF hợp lệ")
+            chunk = head
+            while chunk:
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
                     raise HTTPException(413, f"File vượt quá {MAX_UPLOAD_BYTES // 1024 // 1024} MB")
                 out.write(chunk)
-        if size == 0:
-            raise HTTPException(400, "File rỗng")
-        try:
-            os.replace(tmp, target)  # ghi đè nếu trùng tên
-        except PermissionError:
-            raise HTTPException(409, "File cùng tên đang được xử lý, thử lại sau")
-    finally:
+                chunk = await file.read(1024 * 1024)
+    except BaseException:
         tmp.unlink(missing_ok=True)
-    return size
+        raise
+    return tmp, size
 
 
 @app.post("/upload", status_code=202)
@@ -257,24 +265,40 @@ async def upload(
     target_dir = DOCUMENTS_DIR / folder
     target_dir.mkdir(parents=True, exist_ok=True)
     batch_id = uuid.uuid4().hex
-    accepted, rejected, total = [], [], 0
+    staged: list[tuple[str, Path]] = []  # (tên file, file .part) chưa đổi tên
+    accepted, rejected, seen, total = [], [], set(), 0
     try:
         for up in uploads:
             try:
                 filename = safe_filename(up.filename)
-                if filename in accepted:
+                if filename.casefold() in seen:  # Windows không phân biệt hoa/thường
                     raise HTTPException(400, "File trùng tên với file trước đó trong lô")
-                total += await save_upload(up, target_dir, filename)
+                tmp, size = await stage_upload(up, target_dir)
             except HTTPException as e:  # lỗi của một file không làm hỏng cả lô
                 rejected.append({"filename": up.filename, "reason": e.detail})
                 continue
-            accepted.append(filename)
+            except OSError as e:
+                rejected.append({"filename": up.filename, "reason": f"Không ghi được file: {e}"})
+                continue
+            seen.add(filename.casefold())
+            staged.append((filename, tmp))
+            total += size
             if total > MAX_BATCH_BYTES:
                 raise HTTPException(413, f"Tổng dung lượng vượt quá {MAX_BATCH_BYTES // 1024 // 1024} MB")
-    except HTTPException:
-        for name in accepted:  # từ chối cả request: không để lại file nào của lô này
-            (target_dir / name).unlink(missing_ok=True)
-        raise
+
+        # cả lô đã qua kiểm tra: lúc này mới ghi đè file thật
+        for filename, tmp in staged:
+            try:
+                os.replace(tmp, target_dir / filename)
+            except PermissionError:
+                rejected.append({"filename": filename, "reason": "File cùng tên đang được xử lý, thử lại sau"})
+            except OSError as e:
+                rejected.append({"filename": filename, "reason": f"Không ghi được file: {e}"})
+            else:
+                accepted.append(filename)
+    finally:
+        for _, tmp in staged:
+            tmp.unlink(missing_ok=True)  # lô bị từ chối hoặc lỗi bất ngờ: chỉ xoá file tạm, file cũ còn nguyên
     if not accepted:
         raise HTTPException(400, {"message": "Không có file nào hợp lệ", "rejected": rejected})
 
