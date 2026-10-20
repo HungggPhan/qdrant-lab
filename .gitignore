@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+models/
+bin/
+documents/
+*.db
+*.log
+CLAUDE.md
+.claude/
+skills-lock.json

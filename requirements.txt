@@ -1,0 +1,7 @@
+qdrant-client
+sentence-transformers
+
+pypdf
+fastapi
+uvicorn
+python-multipart

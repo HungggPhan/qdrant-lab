@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat tài liệu</title>
+<style>
+  :root { --bg:#fff; --fg:#1d1d1f; --muted:#6b6b72; --line:#e2e2e7; --card:#f6f6f9; --accent:#2457d6; --hit:#fff4cc; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16161a; --fg:#ececf0; --muted:#9a9aa5; --line:#2e2e36; --card:#202027; --accent:#7a9dff; --hit:#4a3f12; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.55 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 1.5rem 1rem 8rem; }
+  h1 { font-size: 1.25rem; margin: 0 0 .75rem; }
+  .bar { display: flex; gap: .5rem; margin-bottom: 1.25rem; }
+  .bar select { flex: 1; min-width: 0; font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .4rem .5rem; }
+  .bar button { padding: .4rem .8rem; }
+  .bar button.ghost { background: var(--card); color: var(--fg); border: 1px solid var(--line); }
+  .turn { margin-bottom: 1.75rem; }
+  .q { font-weight: 600; margin-bottom: .5rem; }
+  .a { white-space: pre-wrap; }
+  .a.pending::after { content: "▍"; color: var(--muted); animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .status { color: var(--muted); font-size: .9rem; }
+  .err { color: #c0392b; }
+  .cite { color: var(--accent); cursor: pointer; font-weight: 600; }
+  .sources { margin-top: .75rem; }
+  .sources h2 { font-size: .85rem; color: var(--muted); font-weight: 600; margin: 0 0 .35rem; text-transform: uppercase; letter-spacing: .04em; }
+  details.src { border: 1px solid var(--line); background: var(--card); border-radius: 8px; margin-bottom: .4rem; }
+  details.src.cited { border-color: var(--accent); }
+  details.src.flash { background: var(--hit); }
+  details.src summary { cursor: pointer; padding: .5rem .75rem; font-size: .92rem; }
+  details.src .meta { color: var(--muted); }
+  details.src pre { margin: 0; padding: .6rem .75rem .75rem; border-top: 1px solid var(--line); white-space: pre-wrap; word-break: break-word; font-family: inherit; font-size: .9rem; line-height: 1.5; max-height: 22rem; overflow: auto; }
+  form { position: fixed; left: 0; right: 0; bottom: 0; background: var(--bg); border-top: 1px solid var(--line); padding: .75rem 1rem; }
+  form .row { max-width: 760px; margin: 0 auto; display: flex; gap: .5rem; }
+  textarea { flex: 1; resize: none; font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .55rem .7rem; }
+  button { font: inherit; border: 0; border-radius: 8px; padding: 0 1.1rem; background: var(--accent); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Hỏi đáp tài liệu</h1>
+  <div class="bar">
+    <select id="convs" aria-label="Lịch sử hội thoại"></select>
+    <button id="newc" type="button">Cuộc mới</button>
+    <button id="delc" type="button" class="ghost">Xoá</button>
+  </div>
+  <div id="log"></div>
+</main>
+<form id="f">
+  <div class="row">
+    <textarea id="q" rows="2" placeholder="Nhập câu hỏi tiếng Việt (Enter để gửi, Shift+Enter xuống dòng)" required></textarea>
+    <button id="send">Gửi</button>
+  </div>
+</form>
+<script>
+const logEl = document.getElementById('log');
+const form = document.getElementById('f');
+const input = document.getElementById('q');
+const sendBtn = document.getElementById('send');
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+// Dựng phần nguồn từ metadata thật; chunk nằm trong <details> để mở ra kiểm chứng.
+function renderSources(box, sources) {
+  box.replaceChildren();
+  if (!sources.length) return;
+  box.append(el('h2', null, 'Nguồn đã dùng'));
+  for (const s of sources) {
+    const d = el('details', 'src');
+    d.id = box.id + '-' + s.n;
+    const sum = el('summary');
+    sum.append(el('b', null, '[' + s.n + '] '), document.createTextNode(s.source + ' '),
+      el('span', 'meta', '· thư mục ' + s.folder + ' · trang ' + s.page + ' · chunk #' + s.chunk_index + ' · điểm ' + s.score));
+    d.append(sum, el('pre', null, s.text));
+    box.append(d);
+  }
+}
+
+// Biến "[1]" trong câu trả lời thành liên kết mở nguồn tương ứng (chỉ số có thật).
+function renderAnswer(a, text, box, n) {
+  a.replaceChildren();
+  for (const part of text.split(/(\[\d+\])/)) {
+    const m = part.match(/^\[(\d+)\]$/);
+    if (m && +m[1] >= 1 && +m[1] <= n) {
+      const c = el('span', 'cite', part);
+      c.onclick = () => {
+        const d = document.getElementById(box.id + '-' + m[1]);
+        d.open = true; d.scrollIntoView({block: 'center', behavior: 'smooth'});
+        d.classList.add('flash'); setTimeout(() => d.classList.remove('flash'), 1200);
+      };
+      a.append(c);
+    } else a.append(document.createTextNode(part));
+  }
+}
+
+let seq = 0;
+let convId = null;
+const convsEl = document.getElementById('convs');
+
+function addTurn(question) {
+  const turn = el('div', 'turn');
+  const a = el('div', 'a');
+  const status = el('div', 'status');
+  const box = el('div', 'sources'); box.id = 's' + (++seq);
+  turn.append(el('div', 'q', question), status, a, box);
+  logEl.append(turn);
+  return {turn, a, status, box};
+}
+
+// Danh sách hội thoại lưu ở server (chat.db); `select` chọn cuộc nào thì nạp lại cuộc đó.
+async function refreshConvs() {
+  const list = await (await fetch('/conversations')).json();
+  convsEl.replaceChildren(new Option('— Cuộc trò chuyện mới —', ''));
+  for (const c of list) convsEl.append(new Option(c.title, c.id));
+  convsEl.value = convId && list.some(c => c.id === convId) ? convId : '';
+}
+
+async function openConv(id) {
+  logEl.replaceChildren();
+  convId = id || null;
+  if (!id) return;
+  const r = await fetch('/conversations/' + id);
+  if (!r.ok) { convId = null; return; }
+  for (const m of (await r.json()).messages) {
+    const t = addTurn(m.question);
+    renderSources(t.box, m.sources);
+    renderAnswer(t.a, m.answer, t.box, m.sources.length);
+    for (const n of m.cited) document.getElementById(t.box.id + '-' + n)?.classList.add('cited');
+  }
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+convsEl.onchange = () => openConv(convsEl.value);
+document.getElementById('newc').onclick = () => { convsEl.value = ''; openConv(''); input.focus(); };
+document.getElementById('delc').onclick = async () => {
+  if (!convId || !confirm('Xoá cuộc trò chuyện này?')) return;
+  await fetch('/conversations/' + convId, {method: 'DELETE'});
+  await openConv(''); await refreshConvs();
+};
+
+async function ask(question) {
+  const {turn, a, status, box} = addTurn(question);
+  a.classList.add('pending');
+  status.textContent = 'Đang tìm trong tài liệu...';
+  turn.scrollIntoView({block: 'start'});
+
+  let text = '', sources = [];
+  try {
+    const r = await fetch('/chat', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question, conversation_id: convId})});
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.status);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1);
+        if (!line.trim()) continue;
+        const ev = JSON.parse(line);
+        if (ev.type === 'conversation') {
+          convId = ev.id;
+        } else if (ev.type === 'sources') {
+          sources = ev.sources; renderSources(box, sources);
+          status.textContent = sources.length ? 'Đang trả lời (mô hình chạy CPU nên có thể mất vài chục giây)...' : '';
+        } else if (ev.type === 'token') {
+          text += ev.text; a.textContent = text; status.textContent = '';
+        } else if (ev.type === 'error') {
+          throw new Error(ev.message);
+        } else if (ev.type === 'done') {
+          renderAnswer(a, text, box, sources.length);
+          for (const n of ev.cited) document.getElementById(box.id + '-' + n)?.classList.add('cited');
+        }
+      }
+    }
+  } catch (e) {
+    status.className = 'status err'; status.textContent = 'Lỗi: ' + e.message;
+  }
+  a.classList.remove('pending');
+  refreshConvs();
+}
+
+form.onsubmit = async e => {
+  e.preventDefault();
+  const q = input.value.trim();
+  if (!q) return;
+  input.value = ''; sendBtn.disabled = true; input.disabled = true;
+  await ask(q);
+  sendBtn.disabled = false; input.disabled = false; input.focus();
+};
+input.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); form.requestSubmit(); } };
+refreshConvs();
+</script>
+</body>
+</html>
